@@ -100,6 +100,28 @@ def initialise() -> None:
                 CHECK ((lease_token IS NULL) = (lease_to_seq IS NULL)),
                 CHECK (lease_to_seq IS NULL OR lease_to_seq >= lease_from_seq)
             );
+
+            -- One row per transfer_id: the idempotency key for cross-stream
+            -- atomic transfers. Besides the request parameters it stores the
+            -- assigned event sequences and a snapshot of both stream states
+            -- right after the transfer, so a same-parameter retry can return
+            -- the original result verbatim without re-applying anything.
+            CREATE TABLE IF NOT EXISTS transfers (
+                transfer_id          TEXT PRIMARY KEY,
+                source_stream_id     TEXT    NOT NULL,
+                target_stream_id     TEXT    NOT NULL,
+                amount               INTEGER NOT NULL CHECK (amount > 0),
+                source_sequence      INTEGER NOT NULL CHECK (source_sequence >= 0),
+                target_sequence      INTEGER NOT NULL CHECK (target_sequence >= 0),
+                source_balance       INTEGER NOT NULL,
+                source_next_sequence INTEGER NOT NULL CHECK (source_next_sequence >= 0),
+                target_balance       INTEGER NOT NULL,
+                target_next_sequence INTEGER NOT NULL CHECK (target_next_sequence >= 0),
+                source_pending       TEXT    NOT NULL,
+                target_pending       TEXT    NOT NULL,
+                FOREIGN KEY (source_stream_id) REFERENCES streams(stream_id),
+                FOREIGN KEY (target_stream_id) REFERENCES streams(stream_id)
+            );
             """
         )
     finally:

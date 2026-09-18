@@ -70,6 +70,40 @@ def _pending_sequences(conn: sqlite3.Connection, stream_id: str) -> list[int]:
     return [row["sequence"] for row in rows]
 
 
+def _catch_up(
+    conn: sqlite3.Connection, stream_id: str, balance: int, next_sequence: int
+) -> tuple[int, int]:
+    """Apply the contiguous run of unapplied events starting at ``next_sequence``.
+
+    Folds each event's delta into ``balance``, marks it applied and persists the
+    new ``balance``/``next_sequence`` on the streams row. Shared by
+    :func:`submit_event` and the cross-stream transfer so both follow the exact
+    same contiguous-application rules. Returns ``(balance, next_sequence)``.
+    """
+    expected = next_sequence
+    while True:
+        row = conn.execute(
+            "SELECT event_id, delta FROM events "
+            "WHERE stream_id = ? AND sequence = ? AND applied = 0",
+            (stream_id, expected),
+        ).fetchone()
+        if row is None:
+            break
+        balance += row["delta"]
+        conn.execute(
+            "UPDATE events SET applied = 1 "
+            "WHERE stream_id = ? AND sequence = ?",
+            (stream_id, expected),
+        )
+        expected += 1
+
+    conn.execute(
+        "UPDATE streams SET balance = ?, next_sequence = ? WHERE stream_id = ?",
+        (balance, expected, stream_id),
+    )
+    return balance, expected
+
+
 def get_stream_state(stream_id: str) -> StreamState | None:
     with db.read_connection() as conn:
         stream = _get_stream(conn, stream_id)
@@ -129,27 +163,7 @@ def submit_event(
             replayed = False
 
         # Contiguous catch-up, executed inside the same transaction.
-        expected = next_sequence
-        while True:
-            row = conn.execute(
-                "SELECT event_id, delta FROM events "
-                "WHERE stream_id = ? AND sequence = ? AND applied = 0",
-                (stream_id, expected),
-            ).fetchone()
-            if row is None:
-                break
-            balance += row["delta"]
-            conn.execute(
-                "UPDATE events SET applied = 1 "
-                "WHERE stream_id = ? AND sequence = ?",
-                (stream_id, expected),
-            )
-            expected += 1
-
-        conn.execute(
-            "UPDATE streams SET balance = ?, next_sequence = ? WHERE stream_id = ?",
-            (balance, expected, stream_id),
-        )
+        balance, expected = _catch_up(conn, stream_id, balance, next_sequence)
 
         state = StreamState(
             stream_id=stream_id,

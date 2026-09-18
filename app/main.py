@@ -7,9 +7,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from . import consumers, db, forks, repo
+from . import consumers, db, forks, repo, transfers
 
 
 @asynccontextmanager
@@ -24,7 +24,8 @@ app = FastAPI(
     description=(
         "Submit delta events with per-stream sequence numbers. Contiguous events "
         "are folded into the stream balance; gaps are buffered and caught up "
-        "atomically when the missing event arrives."
+        "atomically when the missing event arrives. Streams can be forked, "
+        "consumed via leased cursors, and linked by atomic cross-stream transfers."
     ),
     lifespan=lifespan,
 )
@@ -134,6 +135,51 @@ class ForkOut(BaseModel):
     next_sequence: int = Field(..., description="Initial next_sequence of the target stream")
 
 
+class TransferIn(BaseModel):
+    transfer_id: str = Field(..., min_length=1, description="Client-assigned idempotency key, globally unique")
+    source_stream_id: str = Field(..., min_length=1, description="Existing stream the amount is debited from")
+    target_stream_id: str = Field(..., min_length=1, description="Existing stream the amount is credited to")
+    amount: int = Field(..., ge=1, description="Positive integer amount to move")
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _reject_bool(cls, value):
+        # In lax mode pydantic accepts bool as int; JSON booleans are not integers here.
+        if isinstance(value, bool):
+            raise ValueError("must be an integer, not a boolean")
+        return value
+
+    @model_validator(mode="after")
+    def _streams_must_differ(self):
+        if self.source_stream_id == self.target_stream_id:
+            raise ValueError("source_stream_id and target_stream_id must be different streams")
+        return self
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "transfer_id": "xfer-1",
+                    "source_stream_id": "acct-1",
+                    "target_stream_id": "acct-2",
+                    "amount": 50,
+                }
+            ]
+        }
+    }
+
+
+class TransferOut(BaseModel):
+    transfer_id: str
+    source_stream_id: str
+    target_stream_id: str
+    amount: int
+    source_sequence: int = Field(..., description="Sequence of the debit event appended to the source stream")
+    target_sequence: int = Field(..., description="Sequence of the credit event appended to the target stream")
+    source: StreamStateOut = Field(..., description="Source stream state right after the transfer")
+    target: StreamStateOut = Field(..., description="Target stream state right after the transfer")
+
+
 @app.get("/health", tags=["meta"])
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -227,6 +273,45 @@ def fork_stream(stream_id: str, body: ForkIn):
     ).model_dump()
     # Idempotent replays return 200; first-time forks return 201.
     return JSONResponse(payload, status_code=200 if fork.replayed else 201)
+
+
+@app.post(
+    "/transfers",
+    response_model=TransferOut,
+    status_code=201,
+    responses={200: {"model": TransferOut, "description": "Idempotent replay of an existing transfer"}},
+    tags=["transfers"],
+    summary="Atomically move a positive amount between two existing streams",
+)
+def create_transfer(body: TransferIn):
+    try:
+        transfer = transfers.execute_transfer(
+            body.transfer_id, body.source_stream_id, body.target_stream_id, body.amount
+        )
+    except transfers.TransferError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    except sqlite3.IntegrityError as exc:
+        # Defence in depth: the UNIQUE constraints map to a 409 as well.
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "integrity_conflict", "message": str(exc)},
+        )
+
+    payload = TransferOut(
+        transfer_id=transfer.transfer_id,
+        source_stream_id=transfer.source_stream_id,
+        target_stream_id=transfer.target_stream_id,
+        amount=transfer.amount,
+        source_sequence=transfer.source_sequence,
+        target_sequence=transfer.target_sequence,
+        source=StreamStateOut(**transfer.source.as_dict()),
+        target=StreamStateOut(**transfer.target.as_dict()),
+    ).model_dump()
+    # Idempotent replays return 200; first-time transfers return 201.
+    return JSONResponse(payload, status_code=200 if transfer.replayed else 201)
 
 
 @app.post(

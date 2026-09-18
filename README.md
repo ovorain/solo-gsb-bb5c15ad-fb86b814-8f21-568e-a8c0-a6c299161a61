@@ -25,6 +25,11 @@
   一个新的、可继续追加事件的目标流；`fork_id` 在同一源流下是幂等键，重试安全，
   分叉记录、目标流和复制事件在同一个 `BEGIN IMMEDIATE` 事务内提交，并发请求不会
   产生半成品。
+- **跨流原子转账（transfer）**：在两个**已存在**的流之间原子转移正整数金额：
+  在同一 `BEGIN IMMEDIATE` 事务内，分别在源/目标流当前 `next_sequence` 处追加
+  扣款/入账事件并完成连续应用；仅当源流余额充足时允许，任一步失败整体回滚，
+  不留事件或余额变化。`transfer_id` 是全局幂等键：同参重试返回原结果且不重复
+  扣款，参数漂移返回 `409`，并发重试只提交一次。
 - 无外部账号、无外部依赖，`docker compose up --build` 一条命令启动。
 
 ## 一键启动
@@ -203,6 +208,70 @@ Content-Type: application/json
 相同 `fork_id` 请求只有一个创建分叉，其余全部拿到既有结果；并发的不同请求若争抢
 同一目标流，只有一个成功，其余得到 `409`，数据库中不会残留半成品目标流。
 
+### 6. 跨流原子转账（transfer）
+
+```
+POST /transfers
+Content-Type: application/json
+```
+
+请求体：
+
+| 字段               | 类型   | 约束                     | 说明                             |
+| ------------------ | ------ | ------------------------ | -------------------------------- |
+| `transfer_id`      | string | 非空，全局唯一           | 客户端分配的幂等键（重试键）     |
+| `source_stream_id` | string | 非空，必须是已存在的流   | 被扣款的源流                     |
+| `target_stream_id` | string | 非空，必须是已存在的流，且与源流不同 | 被入账的目标流         |
+| `amount`           | int    | `>= 1` 的正整数          | 转移金额                         |
+
+仅当**两个流都存在**且**源流当前余额 `>= amount`** 时才允许转账。成功时在同一个
+`BEGIN IMMEDIATE` 事务内：
+
+1. 在源流当前 `next_sequence` 处追加扣款事件（`delta = -amount`，事件 id 为
+   `transfer:{transfer_id}:debit`），在目标流当前 `next_sequence` 处追加入账事件
+   （`delta = +amount`，事件 id 为 `transfer:{transfer_id}:credit`）；
+2. 两侧各自执行与普通提交完全相同的连续追赶（catch-up）：追加的事件立即应用，
+   若其恰好填补了缺号，之前暂存的事件也在同一事务内一并应用；
+3. 更新两侧的 `balance`/`next_sequence` 并写入 `transfers` 幂等记录（含结果快照）。
+
+任一步失败（流不存在、余额不足、约束冲突等）整体回滚：不留下任何事件、余额变化
+或转账记录，失败的 `transfer_id` 之后可以重新使用。
+
+响应（`201 Created`）：
+
+```json
+{
+  "transfer_id": "xfer-1",
+  "source_stream_id": "acct-1",
+  "target_stream_id": "acct-2",
+  "amount": 50,
+  "source_sequence": 3,
+  "target_sequence": 7,
+  "source": {"stream_id": "acct-1", "balance": 300, "next_sequence": 4, "pending_sequences": []},
+  "target": {"stream_id": "acct-2", "balance": 150, "next_sequence": 8, "pending_sequences": []}
+}
+```
+
+- `source_sequence` / `target_sequence`：两侧追加的扣款/入账事件各自的序号；
+- `source` / `target`：转账完成后两侧的最新流状态（与 `GET /streams/{id}` 同构）。
+
+状态码：
+
+- `201 Created`：转账首次提交；
+- `200 OK`：同一 `transfer_id` 携带完全相同参数的幂等重试，返回**首次的原结果**
+  （两侧事件序号与当时的流状态快照），不会重复扣款；
+- `409 Conflict`：
+  - `insufficient_funds`：源流当前余额不足；
+  - `transfer_replay_conflict`：同一 `transfer_id` 重试时 `source_stream_id`、
+    `target_stream_id` 或 `amount` 与首次不同；
+- `404 Not Found`：源流或目标流不存在（`stream_not_found`）；转账**不会**创建流；
+- `422 Unprocessable Entity`：`amount` 非正整数、字段缺失/为空，或
+  `source_stream_id == target_stream_id`。
+
+转账产生的事件就是普通的已应用事件：消费者可以通过 claim/ack 正常消费它们，
+分叉也会把它们包含在已应用前缀内。`transfers.transfer_id` 的主键约束兜底并发：
+20 个线程同时提交同一转账，只有一个真正扣款，其余全部拿到首次的原结果。
+
 ## 工作机制示例
 
 ```bash
@@ -343,6 +412,60 @@ curl -s -X POST localhost:8000/streams/acct-1/forks \
 # {"...","through_sequence":0,"balance":0,"next_sequence":0}
 ```
 
+## 跨流转账示例（transfer）
+
+```bash
+# 准备两个流：acct-1 余额 350（接上文），acct-2 余额 20
+curl -s -X POST localhost:8000/streams/acct-2/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"a2-e0","sequence":0,"delta":20}'
+
+# 从 acct-1 转 50 到 acct-2：同一事务内两侧各追加一个事件并应用
+curl -s -X POST localhost:8000/transfers \
+  -H 'Content-Type: application/json' \
+  -d '{"transfer_id":"xfer-1","source_stream_id":"acct-1","target_stream_id":"acct-2","amount":50}'
+# 201:
+# {"transfer_id":"xfer-1","source_stream_id":"acct-1","target_stream_id":"acct-2",
+#  "amount":50,"source_sequence":3,"target_sequence":1,
+#  "source":{"stream_id":"acct-1","balance":300,"next_sequence":4,"pending_sequences":[]},
+#  "target":{"stream_id":"acct-2","balance":70,"next_sequence":2,"pending_sequences":[]}}
+
+# 相同 transfer_id + 相同参数重试：返回原结果（200），不会重复扣款
+curl -s -i -X POST localhost:8000/transfers \
+  -H 'Content-Type: application/json' \
+  -d '{"transfer_id":"xfer-1","source_stream_id":"acct-1","target_stream_id":"acct-2","amount":50}'
+# HTTP/1.1 200 OK，响应体与首次完全一致；acct-1 余额仍是 300
+
+# 相同 transfer_id 但参数不同：409 transfer_replay_conflict
+curl -s -i -X POST localhost:8000/transfers \
+  -H 'Content-Type: application/json' \
+  -d '{"transfer_id":"xfer-1","source_stream_id":"acct-1","target_stream_id":"acct-2","amount":51}'
+# HTTP/1.1 409
+
+# 余额不足：409 insufficient_funds，且不留任何事件/余额变化
+curl -s -i -X POST localhost:8000/transfers \
+  -H 'Content-Type: application/json' \
+  -d '{"transfer_id":"xfer-2","source_stream_id":"acct-2","target_stream_id":"acct-1","amount":999}'
+# HTTP/1.1 409 -> {"detail":{"code":"insufficient_funds", ...}}
+
+# 任一流不存在：404 stream_not_found（转账不会创建流）
+curl -s -i -X POST localhost:8000/transfers \
+  -H 'Content-Type: application/json' \
+  -d '{"transfer_id":"xfer-3","source_stream_id":"acct-1","target_stream_id":"ghost","amount":1}'
+# HTTP/1.1 404
+
+# amount 非正整数、源/目标流相同：422
+curl -s -i -X POST localhost:8000/transfers \
+  -H 'Content-Type: application/json' \
+  -d '{"transfer_id":"xfer-4","source_stream_id":"acct-1","target_stream_id":"acct-1","amount":1}'
+# HTTP/1.1 422
+
+# 转账事件就是普通事件：消费者可以正常 claim 到扣款/入账事件
+curl -s -X POST localhost:8000/streams/acct-2/consumers/worker-b/claim \
+  -H 'Content-Type: application/json' -d '{"max_events":10}'
+# -> events 含 {"event_id":"transfer:xfer-1:credit","sequence":1,"delta":50}
+```
+
 ## 数据模型
 
 ```text
@@ -354,6 +477,10 @@ forks(source_stream_id, fork_id, target_stream_id, through_sequence, balance,
 consumers(stream_id, consumer_id, cursor_seq,
           lease_token, lease_expires_at, lease_from_seq, lease_to_seq,
           PK(stream_id, consumer_id))
+transfers(transfer_id PK, source_stream_id, target_stream_id, amount,
+          source_sequence, target_sequence,
+          source_balance, source_next_sequence, source_pending,
+          target_balance, target_next_sequence, target_pending)
 ```
 
 - `UNIQUE(stream_id, event_id)` 保证重放幂等；
@@ -404,6 +531,25 @@ consumers(stream_id, consumer_id, cursor_seq,
    `(balance=和, next_sequence=through_sequence)`，把事件以 `applied=1` 原样复制，
    再写入 `forks` 分叉记录，统一提交——任一步失败整体回滚，不留半成品。
 
+转账的处理同样在单个 `BEGIN IMMEDIATE` 事务内完成：
+
+1. 按 `transfer_id` 查 `transfers`：已存在则比对
+   `source_stream_id`/`target_stream_id`/`amount`，不一致返回
+   `409 transfer_replay_conflict`，一致则返回记录中的原结果快照（幂等重试，
+   HTTP `200`，不再触碰任何事件或余额）；
+2. 锁定并读取两个流：任一不存在返回 `404 stream_not_found`（事务内不做任何写入，
+   转账从不创建流）；
+3. 校验源流当前 `balance >= amount`，不足返回 `409 insufficient_funds`；
+4. 在源流当前 `next_sequence` 处插入扣款事件（`delta = -amount`）、在目标流当前
+   `next_sequence` 处插入入账事件（`delta = +amount`），事件 id 分别为
+   `transfer:{transfer_id}:debit` / `transfer:{transfer_id}:credit`；
+5. 两侧各自执行与普通提交完全相同的连续追赶：追加的事件立即应用，若恰好填补
+   缺号，被阻塞的暂存事件也在同一事务内一并应用；
+6. 更新两侧的 `balance`/`next_sequence`，把请求参数与结果快照（两侧事件序号、
+   转账后流状态）写入 `transfers` 并提交——任一步失败整体回滚，不留事件、
+   余额变化或转账记录，失败的 `transfer_id` 可以重用。`transfers.transfer_id`
+   的主键约束兜底并发重试：只会有一个事务真正提交转账。
+
 ## 配置
 
 | 环境变量                | 默认值                | 说明                          |
@@ -426,13 +572,19 @@ token 的三种 409、租约到期后同批重新领取、多消费者独立游�
 并发只产生一个有效租约；流分叉部分覆盖：整段/部分/空前缀复制、暂存事件不复制、
 目标流可继续追加、源流 404、目标已存在 409、上界越界 422、相同参数重试 200 幂等、
 参数漂移 409、请求体 422，以及 20 线程并发（同一 `fork_id` 只产生一个分叉；
-不同 `fork_id` 争抢同一目标流时不留半成品）。
+不同 `fork_id` 争抢同一目标流时不留半成品）；跨流转账部分覆盖：原子扣款/入账与
+两侧事件序号、在当前 `next_sequence` 追加、转账填补缺号触发连续追赶、同参重试
+200 返回原结果且不重复扣款、参数漂移 409、任一流不存在 404 且不创建流、余额不足
+409 且不留痕迹（`transfer_id` 可重用）、全额转出、请求体 422（含源/目标相同）、
+转账事件可被消费者领取与分叉复制，以及并发（20 线程同一 `transfer_id` 只提交一次；
+两笔转账争抢同一余额时恰好一笔成功、绝不透支）。
 
 仅用 Python 标准库验证核心归并算法（无需安装 FastAPI）：
 
 ```bash
 python3 verify_core.py
 python3 verify_forks.py
+python3 verify_transfers.py
 ```
 
 ## 项目结构
@@ -444,12 +596,14 @@ python3 verify_forks.py
 │   ├── main.py        # FastAPI 路由与请求/响应模型
 │   ├── repo.py        # 归并/追赶算法（纯 sqlite3，事务边界清晰）
 │   ├── forks.py       # 流分叉（fork）幂等事务
+│   ├── transfers.py   # 跨流原子转账（transfer）幂等事务
 │   ├── consumers.py   # 消费游标与 claim/ack 租约
 │   ├── db.py          # 连接管理、WAL、schema 初始化
 │   └── config.py      # 环境变量配置
 ├── tests/test_api.py
 ├── verify_core.py
 ├── verify_forks.py
+├── verify_transfers.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
