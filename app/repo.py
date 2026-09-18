@@ -70,6 +70,49 @@ def _pending_sequences(conn: sqlite3.Connection, stream_id: str) -> list[int]:
     return [row["sequence"] for row in rows]
 
 
+def build_state(
+    conn: sqlite3.Connection,
+    stream_id: str,
+    balance: int,
+    next_sequence: int,
+) -> StreamState:
+    return StreamState(
+        stream_id=stream_id,
+        balance=balance,
+        next_sequence=next_sequence,
+        pending_sequences=_pending_sequences(conn, stream_id),
+    )
+
+
+def apply_contiguous(
+    conn: sqlite3.Connection, stream_id: str, balance: int, next_sequence: int
+) -> tuple[int, int]:
+    """Fold every unapplied event contiguous with ``next_sequence``.
+
+    Starts at the stream's current ``next_sequence`` and walks the buffered
+    events in order, adding each ``delta`` to ``balance`` and marking it
+    ``applied = 1``, stopping at the first gap. Must run inside an open write
+    transaction. Returns the resulting ``(balance, next_sequence)``.
+    """
+    expected = next_sequence
+    while True:
+        row = conn.execute(
+            "SELECT event_id, delta FROM events "
+            "WHERE stream_id = ? AND sequence = ? AND applied = 0",
+            (stream_id, expected),
+        ).fetchone()
+        if row is None:
+            break
+        balance += row["delta"]
+        conn.execute(
+            "UPDATE events SET applied = 1 "
+            "WHERE stream_id = ? AND sequence = ?",
+            (stream_id, expected),
+        )
+        expected += 1
+    return balance, expected
+
+
 def get_stream_state(stream_id: str) -> StreamState | None:
     with db.read_connection() as conn:
         stream = _get_stream(conn, stream_id)
@@ -129,32 +172,12 @@ def submit_event(
             replayed = False
 
         # Contiguous catch-up, executed inside the same transaction.
-        expected = next_sequence
-        while True:
-            row = conn.execute(
-                "SELECT event_id, delta FROM events "
-                "WHERE stream_id = ? AND sequence = ? AND applied = 0",
-                (stream_id, expected),
-            ).fetchone()
-            if row is None:
-                break
-            balance += row["delta"]
-            conn.execute(
-                "UPDATE events SET applied = 1 "
-                "WHERE stream_id = ? AND sequence = ?",
-                (stream_id, expected),
-            )
-            expected += 1
+        balance, expected = apply_contiguous(conn, stream_id, balance, next_sequence)
 
         conn.execute(
             "UPDATE streams SET balance = ?, next_sequence = ? WHERE stream_id = ?",
             (balance, expected, stream_id),
         )
 
-        state = StreamState(
-            stream_id=stream_id,
-            balance=balance,
-            next_sequence=expected,
-            pending_sequences=_pending_sequences(conn, stream_id),
-        )
+        state = build_state(conn, stream_id, balance, expected)
         return state, replayed

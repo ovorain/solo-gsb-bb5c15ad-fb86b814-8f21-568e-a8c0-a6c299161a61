@@ -576,3 +576,320 @@ def test_concurrent_forks_distinct_ids_same_target_never_half_build(client):
     assert state["balance"] == 70 and state["next_sequence"] == 2
     claim = _claim(client, "f-race2", "worker", 100).json()
     assert [e["sequence"] for e in claim["events"]] == [0, 1]
+
+
+# --------------------------------------------------------------------------- #
+# Cross-stream atomic transfers
+# --------------------------------------------------------------------------- #
+
+
+def _transfer(client, transfer_id, source, target, amount):
+    return client.post(
+        "/transfers",
+        json={
+            "transfer_id": transfer_id,
+            "source_stream_id": source,
+            "target_stream_id": target,
+            "amount": amount,
+        },
+    )
+
+
+def _seed_balance(client, stream_id, amount):
+    """Create a stream whose sole applied event credits ``amount`` at sequence 0."""
+    r = _post(client, stream_id, f"{stream_id}-seed", 0, amount)
+    assert r.status_code in (200, 201)
+
+
+def test_transfer_moves_amount_and_reports_both_sides(client):
+    _seed_balance(client, "t-a", 100)
+    _seed_balance(client, "t-b", 20)
+
+    r = _transfer(client, "txn-1", "t-a", "t-b", 30)
+    assert r.status_code == 201
+    body = r.json()
+    assert body["replayed"] is False
+    assert body["amount"] == 30
+    assert body["source"] == {
+        "stream_id": "t-a",
+        "event_id": "transfer:txn-1:debit",
+        "sequence": 1,
+        "state": {
+            "stream_id": "t-a",
+            "balance": 70,
+            "next_sequence": 2,
+            "pending_sequences": [],
+        },
+    }
+    assert body["target"] == {
+        "stream_id": "t-b",
+        "event_id": "transfer:txn-1:credit",
+        "sequence": 1,
+        "state": {
+            "stream_id": "t-b",
+            "balance": 50,
+            "next_sequence": 2,
+            "pending_sequences": [],
+        },
+    }
+
+    # The synthetic events are visible through the ordinary stream endpoint.
+    assert client.get("/streams/t-a").json()["balance"] == 70
+    assert client.get("/streams/t-b").json()["balance"] == 50
+
+
+def test_transfer_events_are_consumable_like_normal_events(client):
+    _seed_balance(client, "t-consume-a", 100)
+    _seed_balance(client, "t-consume-b", 0)
+    r = _transfer(client, "txn-consume", "t-consume-a", "t-consume-b", 40)
+    assert r.status_code == 201
+
+    batch_a = _claim(client, "t-consume-a", "worker", 100).json()
+    assert [(e["sequence"], e["delta"]) for e in batch_a["events"]] == [(0, 100), (1, -40)]
+    batch_b = _claim(client, "t-consume-b", "worker", 100).json()
+    assert [(e["sequence"], e["delta"]) for e in batch_b["events"]] == [(0, 0), (1, 40)]
+
+
+def test_transfer_exact_balance_succeeds(client):
+    _seed_balance(client, "t-exact", 50)
+    _seed_balance(client, "t-exact-dst", 0)
+    r = _transfer(client, "txn-exact", "t-exact", "t-exact-dst", 50)
+    assert r.status_code == 201
+    assert r.json()["source"]["state"]["balance"] == 0
+    assert r.json()["target"]["state"]["balance"] == 50
+
+
+def test_transfer_insufficient_funds_returns_422_and_changes_nothing(client):
+    _seed_balance(client, "t-poor", 10)
+    _seed_balance(client, "t-poor-dst", 0)
+    r = _transfer(client, "txn-poor", "t-poor", "t-poor-dst", 11)
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "insufficient_funds"
+
+    # No events, no balance movement, no transfer record.
+    assert client.get("/streams/t-poor").json() == {
+        "stream_id": "t-poor",
+        "balance": 10,
+        "next_sequence": 1,
+        "pending_sequences": [],
+    }
+    assert client.get("/streams/t-poor-dst").json()["balance"] == 0
+    # The same transfer_id is still usable after the failed attempt.
+    assert _transfer(client, "txn-poor", "t-poor", "t-poor-dst", 5).status_code == 201
+
+
+def test_transfer_missing_stream_returns_404_and_creates_nothing(client):
+    _seed_balance(client, "t-existing", 10)
+    r = _transfer(client, "txn-404-a", "t-missing-src", "t-existing", 1)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "source_stream_not_found"
+    assert client.get("/streams/t-missing-src").status_code == 404
+
+    r = _transfer(client, "txn-404-b", "t-existing", "t-missing-dst", 1)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "target_stream_not_found"
+    assert client.get("/streams/t-missing-dst").status_code == 404
+    # Nothing was debited from the existing stream.
+    assert client.get("/streams/t-existing").json()["balance"] == 10
+
+
+def test_transfer_replay_with_same_parameters_returns_original_result(client):
+    _seed_balance(client, "t-rep-a", 100)
+    _seed_balance(client, "t-rep-b", 0)
+    first = _transfer(client, "txn-rep", "t-rep-a", "t-rep-b", 30)
+    assert first.status_code == 201
+    first_body = first.json()
+
+    second = _transfer(client, "txn-rep", "t-rep-a", "t-rep-b", 30)
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["replayed"] is True
+    # Original event coordinates are preserved ...
+    assert (
+        second_body["source"]["sequence"] == first_body["source"]["sequence"] == 1
+    )
+    assert (
+        second_body["target"]["sequence"] == first_body["target"]["sequence"] == 1
+    )
+    assert second_body["source"]["event_id"] == "transfer:txn-rep:debit"
+    assert second_body["target"]["event_id"] == "transfer:txn-rep:credit"
+
+    # ... and the source was not debited a second time.
+    assert client.get("/streams/t-rep-a").json()["balance"] == 70
+    assert client.get("/streams/t-rep-b").json()["balance"] == 30
+    claim = _claim(client, "t-rep-a", "worker", 100).json()
+    assert [e["sequence"] for e in claim["events"]] == [0, 1]
+
+
+def test_transfer_replay_after_other_events_reports_current_state(client):
+    _seed_balance(client, "t-late-a", 100)
+    _seed_balance(client, "t-late-b", 0)
+    first = _transfer(client, "txn-late", "t-late-a", "t-late-b", 30).json()
+
+    # More events land on both streams; the replay keeps the original event
+    # sequences but returns the latest stream state.
+    _post(client, "t-late-a", "a-extra", 2, -5)
+    _post(client, "t-late-b", "b-extra", 2, 7)
+
+    second = _transfer(client, "txn-late", "t-late-a", "t-late-b", 30).json()
+    assert second["source"]["sequence"] == first["source"]["sequence"] == 1
+    assert second["target"]["sequence"] == first["target"]["sequence"] == 1
+    assert second["source"]["state"]["balance"] == 65
+    assert second["source"]["state"]["next_sequence"] == 3
+    assert second["target"]["state"]["balance"] == 37
+    assert second["target"]["state"]["next_sequence"] == 3
+
+
+def test_transfer_replay_with_different_parameters_returns_409(client):
+    _seed_balance(client, "t-conf-a", 100)
+    _seed_balance(client, "t-conf-b", 100)
+    _seed_balance(client, "t-conf-c", 100)
+    assert _transfer(client, "txn-conf", "t-conf-a", "t-conf-b", 10).status_code == 201
+
+    r = _transfer(client, "txn-conf", "t-conf-a", "t-conf-b", 20)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "transfer_replay_conflict"
+
+    r = _transfer(client, "txn-conf", "t-conf-c", "t-conf-b", 10)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "transfer_replay_conflict"
+
+    r = _transfer(client, "txn-conf", "t-conf-a", "t-conf-c", 10)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "transfer_replay_conflict"
+
+    # The clashing retries moved no extra money.
+    assert client.get("/streams/t-conf-a").json()["balance"] == 90
+    assert client.get("/streams/t-conf-b").json()["balance"] == 110
+    assert client.get("/streams/t-conf-c").json()["balance"] == 100
+
+
+def test_concurrent_transfer_retries_commit_exactly_once(client):
+    import threading
+
+    _seed_balance(client, "t-race-a", 100)
+    _seed_balance(client, "t-race-b", 0)
+    statuses: list[int] = []
+
+    def do_transfer():
+        r = _transfer(client, "txn-race", "t-race-a", "t-race-b", 40)
+        statuses.append(r.status_code)
+
+    threads = [threading.Thread(target=do_transfer) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(statuses) == [200] * 19 + [201]
+    assert client.get("/streams/t-race-a").json()["balance"] == 60
+    assert client.get("/streams/t-race-b").json()["balance"] == 40
+    claim_a = _claim(client, "t-race-a", "worker", 100).json()
+    claim_b = _claim(client, "t-race-b", "worker", 100).json()
+    assert [e["sequence"] for e in claim_a["events"]] == [0, 1]
+    assert [e["sequence"] for e in claim_b["events"]] == [0, 1]
+
+
+def test_concurrent_distinct_transfers_serialise_and_conserve_money(client):
+    import threading
+
+    _seed_balance(client, "t-many-a", 100)
+    _seed_balance(client, "t-many-b", 100)
+
+    def do_transfer(i):
+        _transfer(client, f"txn-many-{i}", "t-many-a", "t-many-b", 1)
+
+    threads = [threading.Thread(target=do_transfer, args=(i,)) for i in range(50)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Every one-unit transfer landed exactly once; total money is conserved.
+    state_a = client.get("/streams/t-many-a").json()
+    state_b = client.get("/streams/t-many-b").json()
+    assert state_a["balance"] == 50 and state_a["next_sequence"] == 51
+    assert state_b["balance"] == 150 and state_b["next_sequence"] == 51
+    assert state_a["balance"] + state_b["balance"] == 200
+
+
+def test_transfer_unblocks_buffered_events_on_both_sides(client):
+    # Source: sequence 1 is parked behind a gap at 0; the transfer lands at
+    # next_sequence 0 and must unblock the buffered event via contiguous catch-up.
+    _post(client, "t-gap-a", "a-e1", 1, -30)  # buffered, balance 0, next 0
+    _post(client, "t-gap-b", "b-e1", 1, 5)  # buffered, balance 0, next 0
+    # Seed applied prefixes so both streams exist with spendable balances.
+    _post(client, "t-gap-a", "a-e0", 0, 100)  # catch-up -> balance 70, next 2
+    _post(client, "t-gap-b", "b-e0", 0, 0)  # catch-up -> balance 5, next 2
+    # Park another buffered run behind sequence 3 on both sides.
+    _post(client, "t-gap-a", "a-e4", 4, 2)
+    _post(client, "t-gap-b", "b-e4", 4, 1)
+
+    r = _transfer(client, "txn-gap", "t-gap-a", "t-gap-b", 20)
+    assert r.status_code == 201
+    body = r.json()
+    # Transfer events appended at the current next_sequence (2); sequence 3 is
+    # still a gap on both sides, so [4] stays buffered.
+    assert body["source"]["sequence"] == 2
+    assert body["target"]["sequence"] == 2
+    assert body["source"]["state"] == {
+        "stream_id": "t-gap-a",
+        "balance": 50,  # 70 - 20
+        "next_sequence": 3,
+        "pending_sequences": [4],
+    }
+    assert body["target"]["state"] == {
+        "stream_id": "t-gap-b",
+        "balance": 25,  # 5 + 20
+        "next_sequence": 3,
+        "pending_sequences": [4],
+    }
+
+    # Closing the gap applies the still-buffered event normally.
+    _post(client, "t-gap-a", "a-e3", 3, 1)
+    _post(client, "t-gap-b", "b-e3", 3, 1)
+    assert client.get("/streams/t-gap-a").json()["balance"] == 53
+    assert client.get("/streams/t-gap-b").json()["balance"] == 27
+
+
+def test_transfer_validation_rejects_bad_payloads(client):
+    _seed_balance(client, "t-val", 10)
+    base = {"transfer_id": "g", "source_stream_id": "t-val", "target_stream_id": "x", "amount": 1}
+
+    r = client.post("/transfers", json={**base, "transfer_id": ""})
+    assert r.status_code == 422
+    r = client.post("/transfers", json={**base, "source_stream_id": ""})
+    assert r.status_code == 422
+    r = client.post("/transfers", json={**base, "target_stream_id": ""})
+    assert r.status_code == 422
+    for bad_amount in (0, -1, "5", True):
+        assert client.post("/transfers", json={**base, "amount": bad_amount}).status_code == 422
+    # Source and target must be different streams.
+    r = client.post(
+        "/transfers",
+        json={**base, "target_stream_id": "t-val"},
+    )
+    assert r.status_code == 422
+    # Missing fields.
+    assert client.post("/transfers", json={"transfer_id": "g"}).status_code == 422
+    assert client.post("/transfers", json={}).status_code == 422
+
+
+def test_transfer_coexists_with_forks_and_consumers(client):
+    _seed_balance(client, "t-mix-a", 100)
+    _seed_balance(client, "t-mix-b", 0)
+    assert _transfer(client, "txn-mix-2", "t-mix-a", "t-mix-b", 40).status_code == 201
+
+    # Fork the source: both seed (0) and debit (1) events land in the copy.
+    r = _fork(client, "t-mix-a", "fork-mix", "t-mix-fork", 2)
+    assert r.status_code == 201
+    assert r.json()["balance"] == 60 and r.json()["next_sequence"] == 2
+
+    # Consumers see transfer events in order, and ack still works.
+    batch = _claim(client, "t-mix-a", "worker", 10).json()
+    assert [(e["event_id"], e["sequence"], e["delta"]) for e in batch["events"]] == [
+        ("t-mix-a-seed", 0, 100),
+        ("transfer:txn-mix-2:debit", 1, -40),
+    ]
+    assert _ack(client, "t-mix-a", "worker", batch["lease_token"]).json()["cursor"] == 2
+    assert _claim(client, "t-mix-a", "worker", 10).json()["events"] == []

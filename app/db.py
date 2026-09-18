@@ -82,6 +82,22 @@ def initialise() -> None:
                 FOREIGN KEY (target_stream_id) REFERENCES streams(stream_id)
             );
 
+            -- One row per completed cross-stream transfer: the idempotency key
+            -- is transfer_id alone, and the stored parameters let retries be
+            -- compared. The sequences record where the debit/credit events were
+            -- appended so an idempotent replay can return the original result.
+            CREATE TABLE IF NOT EXISTS transfers (
+                transfer_id      TEXT PRIMARY KEY,
+                source_stream_id TEXT    NOT NULL,
+                target_stream_id TEXT    NOT NULL,
+                amount           INTEGER NOT NULL CHECK (amount > 0),
+                source_sequence  INTEGER NOT NULL CHECK (source_sequence >= 0),
+                target_sequence  INTEGER NOT NULL CHECK (target_sequence >= 0),
+                CHECK (source_stream_id <> target_stream_id),
+                FOREIGN KEY (source_stream_id) REFERENCES streams(stream_id),
+                FOREIGN KEY (target_stream_id) REFERENCES streams(stream_id)
+            );
+
             -- One row per (stream, consumer): the consumption cursor plus the
             -- at-most-one outstanding claim lease. Lease columns are either all
             -- NULL (no lease) or all set together.
